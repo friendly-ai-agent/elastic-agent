@@ -56,3 +56,4 @@ if [[ "$BUILDKITE_PIPELINE_SLUG" == "elastic-agent-binary-dra" ]]; then
     release_manager_login
   fi
 fi
+
