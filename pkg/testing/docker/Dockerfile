@@ -55,6 +55,40 @@ RUN if ! id -u ubuntu >/dev/null 2>&1; then useradd --create-home --shell /bin/b
     && echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/90-ubuntu \
     && chmod 0440 /etc/sudoers.d/90-ubuntu
 
+# Install Docker Engine so tests that spin up helper containers (kafka, logstash, ...)
+# via testcontainers' docker-compose run a *nested* daemon inside this container. The
+# helper containers publish their ports on this container's own localhost, which is
+# exactly what the test code and the agent assume (e.g. KAFKA_ADVERTISED_HOST=localhost
+# and connecting to localhost:9092). A mounted host socket cannot provide that — the
+# ports would land on the host's localhost, unreachable from inside this container.
+# The container already runs --privileged with systemd as PID 1 and a host cgroup
+# namespace, which is what an in-container dockerd needs.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" \
+        > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    # let the 'ubuntu' user (non-sudo tests) reach the daemon socket without sudo
+    && usermod -aG docker ubuntu \
+    # the package's postinst can't enable units in a build container, so do it
+    # explicitly; systemd then starts the daemon at boot
+    && systemctl enable containerd.service docker.service
+
+# The nested daemon's layer storage uses overlay, which the kernel refuses to stack on
+# top of another overlay filesystem (the container's rootfs) — it fails with EINVAL.
+# Back both storage roots with volumes so they sit on the host's real filesystem
+# instead: /var/lib/docker for the daemon, and /var/lib/containerd for the containerd
+# image store (Docker 29's default — image snapshots live here, not under
+# /var/lib/docker). The provisioner removes these anonymous volumes together with the
+# container (docker rm -fv).
+VOLUME /var/lib/docker
+VOLUME /var/lib/containerd
+
 # sshd is socket-activated on modern Ubuntu (ssh.socket listens on :22 and starts
 # ssh.service on the first connection); the openssh-server package already enables it.
 # Just ensure its runtime directory exists.

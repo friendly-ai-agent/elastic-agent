@@ -13,7 +13,9 @@ package docker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -185,7 +187,8 @@ func toolVersions(repoDir string) (struct{ mage, gotestsum string }, error) {
 // removed too.
 func (p *provisioner) Clean(ctx context.Context, _ common.Config, instances []common.Instance) error {
 	for _, instance := range instances {
-		if _, err := p.docker(ctx, nil, "rm", "-f", instance.Name); err != nil {
+		// -v also drops the anonymous /var/lib/docker volume backing the nested daemon
+		if _, err := p.docker(ctx, nil, "rm", "-fv", instance.Name); err != nil {
 			// don't let one failure stop the others
 			p.logger.Logf("Delete container %s failed: %s", instance.Name, err)
 		}
@@ -208,7 +211,7 @@ func (p *provisioner) Clean(ctx context.Context, _ common.Config, instances []co
 		}
 	}
 	for id := range leftovers {
-		if _, err := p.docker(ctx, nil, "rm", "-f", id); err != nil {
+		if _, err := p.docker(ctx, nil, "rm", "-fv", id); err != nil {
 			p.logger.Logf("Delete leftover container %s failed: %s", id, err)
 		}
 	}
@@ -229,7 +232,8 @@ func (p *provisioner) launch(ctx context.Context, batch common.OSBatch, build im
 	}
 
 	// remove any pre-existing container with the same name so the run is fresh
-	_, _ = p.docker(ctx, nil, "rm", "-f", name)
+	// (-v also clears its old /var/lib/docker volume)
+	_, _ = p.docker(ctx, nil, "rm", "-fv", name)
 
 	p.logger.Logf("Starting container %s (%s)", name, image)
 	runArgs := []string{
@@ -251,6 +255,14 @@ func (p *provisioner) launch(ctx context.Context, batch common.OSBatch, build im
 	}
 
 	if err := p.installSSHKey(ctx, name, publicKey); err != nil {
+		return common.Instance{}, err
+	}
+
+	// The image runs a nested Docker daemon for tests that start helper containers
+	// (kafka, logstash, ...). Wait for it to come up before handing back the instance
+	// so those tests don't race a still-starting dockerd, and so a broken DinD setup
+	// fails here with a clear message instead of deep inside a test.
+	if err := p.waitForDockerd(ctx, name); err != nil {
 		return common.Instance{}, err
 	}
 
@@ -287,15 +299,17 @@ func (p *provisioner) installSSHKey(ctx context.Context, name string, publicKey 
 
 // ensureImage builds the systemd image for the given Ubuntu version and baked-in
 // tool versions if it does not already exist locally, returning the image reference.
-// The Go/mage/gotestsum versions are part of the tag so bumping any of them (e.g. via
-// .go-version or go.mod) triggers a rebuild rather than reusing an image with stale
-// baked tools.
+// The Go/mage/gotestsum versions and a hash of the Dockerfile are part of the tag, so
+// bumping any of them (e.g. via .go-version or go.mod) or editing the Dockerfile itself
+// triggers a rebuild rather than reusing an image with stale baked contents.
 func (p *provisioner) ensureImage(ctx context.Context, version string, build imageBuild) (string, error) {
-	image := fmt.Sprintf("%s:%s-go%s-mage%s-gts%s",
+	dfHash := sha256.Sum256(dockerfile)
+	image := fmt.Sprintf("%s:%s-go%s-mage%s-gts%s-df%s",
 		imageRepo, version,
 		strings.TrimPrefix(build.goVersion, "v"),
 		strings.TrimPrefix(build.mageVersion, "v"),
-		strings.TrimPrefix(build.gotestsumVersion, "v"))
+		strings.TrimPrefix(build.gotestsumVersion, "v"),
+		hex.EncodeToString(dfHash[:])[:8])
 	if _, err := p.docker(ctx, nil, "image", "inspect", image); err == nil {
 		return image, nil // already built
 	}
@@ -315,6 +329,30 @@ func (p *provisioner) ensureImage(ctx context.Context, version string, build ima
 		return "", fmt.Errorf("failed to build image %s: %w", image, err)
 	}
 	return image, nil
+}
+
+// waitForDockerd blocks until the nested Docker daemon inside the container responds
+// to `docker info`, or the (bounded) context expires. systemd starts dockerd at boot,
+// so it is usually ready by the time this runs, but the poll makes the dependency
+// explicit and surfaces a daemon that never comes up (e.g. a storage-driver problem)
+// as a clear provisioning error.
+func (p *provisioner) waitForDockerd(ctx context.Context, name string) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	var lastErr error
+	for {
+		if _, err := p.docker(ctx, nil, "exec", name, "docker", "info"); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("nested docker daemon in container %s did not become ready: %w (last error: %w)",
+				name, ctx.Err(), lastErr)
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func (p *provisioner) containerIP(ctx context.Context, name string) (string, error) {

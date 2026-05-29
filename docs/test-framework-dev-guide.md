@@ -623,9 +623,21 @@ Notes:
   It also pre-installs `mage` and `gotestsum` (at the versions pinned in `go.mod`)
   with warm Go module/build caches, so the per-run `make mage && mage
   integration:prepareOnRemote` resolves from cache instead of downloading and
-  compiling. The Go/mage/gotestsum versions are part of the image tag, so bumping any
-  of them (`.go-version` or `go.mod`) rebuilds the image.
-- The containers run `--privileged` (required for systemd).
+  compiling. The Go/mage/gotestsum versions and a hash of the `Dockerfile` are part of
+  the image tag, so bumping any of them (`.go-version` or `go.mod`) or editing the
+  `Dockerfile` rebuilds the image.
+- The image also installs Docker Engine and runs a **nested daemon** (docker-in-docker)
+  so tests that start helper containers via testcontainers' docker-compose (e.g. the
+  Kafka and Logstash output tests in `testing/integration/ess/otel_test.go`) work. Those
+  helper containers publish their ports on the test container's own `localhost`, which
+  is what the test code and agent expect (e.g. `KAFKA_ADVERTISED_HOST=localhost`); a
+  mounted host socket could not provide that. The provisioner waits for the nested
+  daemon to be ready before starting tests. The non-root test user (`ubuntu`) is in the
+  `docker` group, so non-sudo tests reach the daemon too. `/var/lib/docker` and
+  `/var/lib/containerd` are backed by volumes (removed with the container via
+  `docker rm -fv`) because the nested daemon's overlay storage cannot stack on the
+  container's own overlay rootfs.
+- The containers run `--privileged` (required for systemd, and for the nested daemon).
 - **Linux hosts only** for now: the runner reaches the container over its bridge IP
   on port 22, which isn't routable on macOS Docker Desktop (that would require
   publishing the SSH port, which the framework's SSH client doesn't support yet).
