@@ -48,6 +48,13 @@ const (
 	// sshUser is the user the test runner connects as (created in the image).
 	sshUser = "ubuntu"
 
+	// containerModCacheDownload is where the host's Go module download cache is
+	// mounted (read-only) inside the container. It is exposed to Go as a file://
+	// module proxy so module fetches resolve from the host's existing cache instead
+	// of re-downloading over the network. Go still unpacks modules into the
+	// container's own (writable) module cache, so a read-only mount is safe here.
+	containerModCacheDownload = "/var/cache/go-mod-download"
+
 	// mageModule and gotestsumModule are the build tools baked into the image,
 	// pinned to the versions in the repo's go.mod (read at provision time).
 	mageModule      = "github.com/magefile/mage"
@@ -129,9 +136,17 @@ func (p *provisioner) Provision(ctx context.Context, cfg common.Config, batches 
 		gotestsumVersion: tools.gotestsum,
 	}
 
+	// Best-effort: share the host's Go module download cache with the containers as
+	// a read-only file:// proxy to avoid re-downloading modules. Empty if the host
+	// cache can't be located, in which case the containers just use the network.
+	modCache := hostGoModCacheDownload(ctx)
+	if modCache == "" {
+		p.logger.Logf("Host Go module cache not found; containers will download modules over the network")
+	}
+
 	var results []common.Instance
 	for _, batch := range batches {
-		instance, err := p.launch(ctx, batch, build, publicKey)
+		instance, err := p.launch(ctx, batch, build, publicKey, modCache)
 		if err != nil {
 			return nil, fmt.Errorf("instance %s failed: %w", batch.ID, err)
 		}
@@ -181,6 +196,26 @@ func toolVersions(repoDir string) (struct{ mage, gotestsum string }, error) {
 	return out, nil
 }
 
+// hostGoModCacheDownload returns the host's Go module download cache directory
+// ($GOMODCACHE/cache/download), or "" if it can't be determined or doesn't exist.
+// This is the directory Go serves as a file:// module proxy, so mounting it into a
+// container lets module fetches resolve from the host cache instead of the network.
+func hostGoModCacheDownload(ctx context.Context) string {
+	out, err := exec.CommandContext(ctx, "go", "env", "GOMODCACHE").Output()
+	if err != nil {
+		return ""
+	}
+	modcache := strings.TrimSpace(string(out))
+	if modcache == "" {
+		return ""
+	}
+	download := filepath.Join(modcache, "cache", "download")
+	if fi, err := os.Stat(download); err != nil || !fi.IsDir() {
+		return ""
+	}
+	return download
+}
+
 // Clean removes the provisioned containers. Beyond the instances recorded in state,
 // it sweeps any other container this provisioner created (matched by label) so that
 // leftovers from a run cancelled mid-provision — which never made it into state — are
@@ -219,7 +254,8 @@ func (p *provisioner) Clean(ctx context.Context, _ common.Config, instances []co
 }
 
 // launch creates (or recreates) the container for a batch and returns its instance.
-func (p *provisioner) launch(ctx context.Context, batch common.OSBatch, build imageBuild, publicKey []byte) (common.Instance, error) {
+// modCache, when non-empty, is the host Go module download cache to share read-only.
+func (p *provisioner) launch(ctx context.Context, batch common.OSBatch, build imageBuild, publicKey []byte, modCache string) (common.Instance, error) {
 	name := containerName(batch.ID)
 	version := batch.OS.Version
 	if version == "" {
@@ -248,14 +284,22 @@ func (p *provisioner) launch(ctx context.Context, batch common.OSBatch, build im
 		"-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
 		"--tmpfs", "/run",
 		"--tmpfs", "/run/lock",
-		image,
 	}
+	if modCache != "" {
+		// Share the host module cache read-only; configureGoProxy points Go at it.
+		runArgs = append(runArgs, "-v", modCache+":"+containerModCacheDownload+":ro")
+	}
+	runArgs = append(runArgs, image)
 	if _, err := p.docker(ctx, nil, runArgs...); err != nil {
 		return common.Instance{}, fmt.Errorf("failed to start container: %w", err)
 	}
 
 	if err := p.installSSHKey(ctx, name, publicKey); err != nil {
 		return common.Instance{}, err
+	}
+
+	if modCache != "" {
+		p.configureGoProxy(ctx, name)
 	}
 
 	// The image runs a nested Docker daemon for tests that start helper containers
@@ -295,6 +339,20 @@ func (p *provisioner) installSSHKey(ctx context.Context, name string, publicKey 
 		return fmt.Errorf("failed to install SSH key in container %s: %w", name, err)
 	}
 	return nil
+}
+
+// configureGoProxy points the ubuntu user's Go at the read-only host module cache
+// mounted at containerModCacheDownload, falling back to the public proxy then direct
+// for anything the host cache is missing. Writing it to the persistent `go env` file
+// means it is honored by every later go invocation (including those mage shells out
+// to), regardless of the SSH session's environment. Best-effort: a failure here only
+// forfeits the download optimization, so it is logged rather than fatal.
+func (p *provisioner) configureGoProxy(ctx context.Context, name string) {
+	proxy := "file://" + containerModCacheDownload + ",https://proxy.golang.org,direct"
+	script := "export HOME=/home/" + sshUser + "; go env -w GOPROXY=" + proxy
+	if _, err := p.docker(ctx, nil, "exec", name, "su", sshUser, "-c", script); err != nil {
+		p.logger.Logf("Configuring GOPROXY in container %s failed (continuing without the module cache): %s", name, err)
+	}
 }
 
 // ensureImage builds the systemd image for the given Ubuntu version and baked-in
