@@ -1,4 +1,4 @@
-name: Mention in PR
+name: Mention in PR (PoC Demo)
 on:
   issue_comment:
     types: [created]
@@ -6,22 +6,28 @@ on:
     types: [created]
 
 permissions:
-  actions: read
   contents: write
-  discussions: write
-  issues: write
   pull-requests: write
 
 jobs:
   run:
+    runs-on: ubuntu-latest
     if: >-
-      (startsWith(github.event.comment.body, '/ai') || contains(github.event.comment.body, '@claude')) &&
-      (github.event.issue.pull_request != null || github.event_name == 'pull_request_review_comment')
-    uses: elastic/ai-github-actions/.github/workflows/gh-aw-mention-in-pr.lock.yml@v0
-    with:
-      setup-commands: |
-        sudo apt-get update && sudo apt-get install -y libpcap-dev librpm-dev python3-venv
-        export GOTOOLCHAIN=auto
-        make mage
-    secrets:
-      COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+      (startsWith(github.event.comment.body, '/ai') ||
+       contains(github.event.comment.body, '@claude')) &&
+      (github.event.issue.pull_request != null ||
+       github.event_name == 'pull_request_review_comment')
+    steps:
+      - name: PoC - no author_association check
+        env:
+          COPILOT_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+          COMMIT_TOKEN:  ${{ secrets.EXTRA_COMMIT_GITHUB_TOKEN }}
+        run: |
+          echo "=== VULNERABILITY CONFIRMED ==="
+          echo "Triggered by:          ${{ github.actor }}"
+          echo "Author association:    ${{ github.event.comment.author_association }}"
+          echo "Comment body:          ${{ github.event.comment.body }}"
+          echo "COPILOT_GITHUB_TOKEN:  $([ -n \"$COPILOT_TOKEN\" ] && echo SET || echo NOT_SET)"
+          echo "EXTRA_COMMIT_TOKEN:    $([ -n \"$COMMIT_TOKEN\" ]  && echo SET || echo NOT_SET)"
+          echo "Permissions active:    contents:write pull-requests:write"
+          echo "No author_association guard prevented this run."
